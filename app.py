@@ -6,8 +6,8 @@ import numpy as np
 from datetime import datetime, timedelta
 import plotly.graph_objs as go
 from plotly.subplots import make_subplots
-from prophet import Prophet
-from prophet.plot import plot_plotly
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import MinMaxScaler
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -145,29 +145,22 @@ with st.sidebar:
     prediction_days = st.slider(
         "Days to Predict",
         min_value=7,
-        max_value=365,
+        max_value=90,
         value=30,
-        step=7,
+        step=1,
         help="Number of days to predict into the future"
     )
     
-    # Model parameters
-    with st.expander("⚡ Advanced Settings"):
-        changepoint_prior_scale = st.slider(
-            "Changepoint Prior Scale",
-            0.001, 0.5, 0.05,
-            help="Flexibility of trend changes (higher = more flexible)"
-        )
-        seasonality_prior_scale = st.slider(
-            "Seasonality Prior Scale",
-            0.01, 10.0, 10.0,
-            help="Strength of seasonality component"
-        )
-        include_market_days = st.checkbox(
-            "Trading Days Only",
-            value=True,
-            help="Predict only for market trading days"
-        )
+    # Model selection
+    st.subheader("🤖 Prediction Model")
+    model_type = st.selectbox(
+        "Select Algorithm",
+        ["Linear Regression", "Polynomial Regression", "Moving Average"],
+        help="Choose the prediction algorithm"
+    )
+    
+    if model_type == "Polynomial Regression":
+        poly_degree = st.slider("Polynomial Degree", 2, 5, 3)
     
     predict_button = st.button("🔮 Predict Stock Price", type="primary", use_container_width=True)
     
@@ -192,31 +185,6 @@ def load_stock_data(symbol, start, end):
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
         return None, None
-
-def format_inr(amount):
-    """Format number in Indian currency style"""
-    s = str(int(amount))
-    if len(s) <= 3:
-        return f"₹{s}"
-    
-    # Indian numbering system
-    result = s[-3:]
-    s = s[:-3]
-    while s:
-        if len(s) <= 2:
-            result = s + ',' + result
-            break
-        result = s[-2:] + ',' + result
-        s = s[:-2]
-    
-    return f"₹{result}"
-
-def format_inr_decimal(amount):
-    """Format decimal number in Indian currency"""
-    integer_part = int(amount)
-    decimal_part = amount - integer_part
-    formatted_integer = format_inr(integer_part)
-    return f"{formatted_integer}.{decimal_part:.2f}"[:-3] + f"{amount:.2f}"[-3:]
 
 def calculate_metrics(df):
     """Calculate stock metrics"""
@@ -322,64 +290,149 @@ def create_candlestick_chart(df, symbol_name):
     
     return fig
 
-def predict_stock(df, days, changepoint_scale, seasonality_scale):
-    """Predict stock prices using Prophet"""
-    # Prepare data for Prophet
-    prophet_df = df.reset_index()[['Date', 'Close']].rename(
-        columns={'Date': 'ds', 'Close': 'y'}
+def prepare_data_for_prediction(df):
+    """Prepare data for ML prediction"""
+    df = df.copy()
+    df['Days'] = np.arange(len(df))
+    return df
+
+def predict_linear_regression(df, days):
+    """Predict using Linear Regression"""
+    # Prepare data
+    X = np.array(df['Days']).reshape(-1, 1)
+    y = np.array(df['Close'])
+    
+    # Train model
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # Predict future
+    last_day = df['Days'].iloc[-1]
+    future_days = np.array([last_day + i for i in range(1, days + 1)]).reshape(-1, 1)
+    predictions = model.predict(future_days)
+    
+    # Calculate confidence intervals (simple estimation)
+    residuals = y - model.predict(X)
+    std_error = np.std(residuals)
+    
+    upper_bound = predictions + (2 * std_error)
+    lower_bound = predictions - (2 * std_error)
+    
+    return predictions, upper_bound, lower_bound
+
+def predict_polynomial_regression(df, days, degree=3):
+    """Predict using Polynomial Regression"""
+    from sklearn.preprocessing import PolynomialFeatures
+    
+    # Prepare data
+    X = np.array(df['Days']).reshape(-1, 1)
+    y = np.array(df['Close'])
+    
+    # Create polynomial features
+    poly_features = PolynomialFeatures(degree=degree)
+    X_poly = poly_features.fit_transform(X)
+    
+    # Train model
+    model = LinearRegression()
+    model.fit(X_poly, y)
+    
+    # Predict future
+    last_day = df['Days'].iloc[-1]
+    future_days = np.array([last_day + i for i in range(1, days + 1)]).reshape(-1, 1)
+    future_days_poly = poly_features.transform(future_days)
+    predictions = model.predict(future_days_poly)
+    
+    # Calculate confidence intervals
+    residuals = y - model.predict(X_poly)
+    std_error = np.std(residuals)
+    
+    upper_bound = predictions + (2 * std_error)
+    lower_bound = predictions - (2 * std_error)
+    
+    return predictions, upper_bound, lower_bound
+
+def predict_moving_average(df, days, window=30):
+    """Predict using Moving Average"""
+    # Calculate moving average
+    ma = df['Close'].rolling(window=window).mean()
+    trend = ma.iloc[-1] - ma.iloc[-window]
+    daily_trend = trend / window
+    
+    # Simple linear projection
+    predictions = []
+    last_price = df['Close'].iloc[-1]
+    
+    for i in range(1, days + 1):
+        predicted_price = last_price + (daily_trend * i)
+        predictions.append(predicted_price)
+    
+    predictions = np.array(predictions)
+    
+    # Calculate confidence intervals based on historical volatility
+    volatility = df['Close'].pct_change().std() * df['Close'].iloc[-1]
+    
+    upper_bound = predictions + (2 * volatility * np.sqrt(np.arange(1, days + 1)))
+    lower_bound = predictions - (2 * volatility * np.sqrt(np.arange(1, days + 1)))
+    
+    return predictions, upper_bound, lower_bound
+
+def create_prediction_chart(df, predictions, upper_bound, lower_bound, symbol_name, days):
+    """Create prediction chart"""
+    # Generate future dates
+    last_date = df.index[-1]
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=days, freq='D')
+    
+    fig = go.Figure()
+    
+    # Historical data
+    fig.add_trace(go.Scatter(
+        x=df.index,
+        y=df['Close'],
+        mode='lines',
+        name='Historical Price',
+        line=dict(color='blue', width=2)
+    ))
+    
+    # Predictions
+    fig.add_trace(go.Scatter(
+        x=future_dates,
+        y=predictions,
+        mode='lines',
+        name='Predicted Price',
+        line=dict(color='red', width=2, dash='dash')
+    ))
+    
+    # Confidence interval
+    fig.add_trace(go.Scatter(
+        x=future_dates,
+        y=upper_bound,
+        mode='lines',
+        name='Upper Bound',
+        line=dict(color='rgba(255,0,0,0.2)', width=0),
+        showlegend=True
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=future_dates,
+        y=lower_bound,
+        mode='lines',
+        name='Lower Bound',
+        line=dict(color='rgba(255,0,0,0.2)', width=0),
+        fill='tonexty',
+        fillcolor='rgba(255,0,0,0.1)',
+        showlegend=True
+    ))
+    
+    fig.update_layout(
+        title=f'{symbol_name} - Price Prediction ({days} days)',
+        xaxis_title='Date',
+        yaxis_title='Price (INR ₹)',
+        height=500,
+        template='plotly_white',
+        hovermode='x unified'
     )
     
-    # Initialize and fit model
-    model = Prophet(
-        changepoint_prior_scale=changepoint_scale,
-        seasonality_prior_scale=seasonality_scale,
-        daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=True
-    )
-    
-    # Add Indian market holidays (you can expand this list)
-    indian_holidays = pd.DataFrame({
-        'holiday': 'indian_market_holiday',
-        'ds': pd.to_datetime([
-            '2024-01-26',  # Republic Day
-            '2024-03-08',  # Maha Shivratri
-            '2024-03-25',  # Holi
-            '2024-03-29',  # Good Friday
-            '2024-04-11',  # Id-Ul-Fitr
-            '2024-04-17',  # Ram Navami
-            '2024-04-21',  # Mahavir Jayanti
-            '2024-05-01',  # Maharashtra Day
-            '2024-06-17',  # Bakri Id
-            '2024-07-17',  # Muharram
-            '2024-08-15',  # Independence Day
-            '2024-08-26',  # Janmashtami
-            '2024-10-02',  # Gandhi Jayanti
-            '2024-10-12',  # Dussehra
-            '2024-11-01',  # Diwali
-            '2024-11-15',  # Gurunanak Jayanti
-            '2024-12-25',  # Christmas
-        ]),
-        'lower_window': 0,
-        'upper_window': 0,
-    })
-    
-    model = Prophet(
-        holidays=indian_holidays,
-        changepoint_prior_scale=changepoint_scale,
-        seasonality_prior_scale=seasonality_scale,
-        daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=True
-    )
-    
-    model.fit(prophet_df)
-    
-    # Make future dataframe
-    future = model.make_future_dataframe(periods=days)
-    forecast = model.predict(future)
-    
-    return model, forecast
+    return fig
 
 # Main App Logic
 if predict_button:
@@ -392,7 +445,7 @@ if predict_button:
             st.info("💡 Make sure to add .NS for NSE stocks or .BO for BSE stocks")
         else:
             # Reset index to have Date as a column
-            df = df.reset_index()
+            df_display = df.reset_index()
             
             # Company Information Header
             st.markdown("---")
@@ -422,7 +475,7 @@ if predict_button:
             st.markdown("---")
             
             # Calculate and display metrics
-            metrics = calculate_metrics(df)
+            metrics = calculate_metrics(df_display.set_index('Date'))
             
             st.subheader("📊 Key Metrics")
             
@@ -465,7 +518,7 @@ if predict_button:
             
             # Historical data chart
             st.subheader("📈 Historical Price Analysis")
-            fig_historical = create_candlestick_chart(df.set_index('Date'), display_name)
+            fig_historical = create_candlestick_chart(df, display_name)
             st.plotly_chart(fig_historical, use_container_width=True)
             
             # Technical Analysis
@@ -492,45 +545,40 @@ if predict_button:
             st.markdown("---")
             
             # Predictions
-            st.subheader("🔮 AI-Powered Price Predictions")
+            st.subheader(f"🔮 Price Predictions using {model_type}")
             
             with st.spinner('🤖 Generating predictions using Machine Learning...'):
                 try:
-                    model, forecast = predict_stock(
+                    # Prepare data
+                    df_pred = prepare_data_for_prediction(df_display.set_index('Date').reset_index())
+                    
+                    # Get predictions based on selected model
+                    if model_type == "Linear Regression":
+                        predictions, upper_bound, lower_bound = predict_linear_regression(df_pred, prediction_days)
+                    elif model_type == "Polynomial Regression":
+                        predictions, upper_bound, lower_bound = predict_polynomial_regression(df_pred, prediction_days, poly_degree)
+                    else:  # Moving Average
+                        predictions, upper_bound, lower_bound = predict_moving_average(df_pred, prediction_days)
+                    
+                    # Create and display prediction chart
+                    fig_pred = create_prediction_chart(
                         df,
-                        prediction_days,
-                        changepoint_prior_scale,
-                        seasonality_prior_scale
+                        predictions,
+                        upper_bound,
+                        lower_bound,
+                        display_name,
+                        prediction_days
                     )
-                    
-                    # Plot forecast
-                    fig_forecast = plot_plotly(model, forecast)
-                    fig_forecast.update_layout(
-                        title=f'{display_name} - {prediction_days} Days Price Forecast',
-                        xaxis_title='Date',
-                        yaxis_title='Price (INR ₹)',
-                        height=500,
-                        template='plotly_white'
-                    )
-                    
-                    # Update colors to match Indian theme
-                    fig_forecast.update_traces(
-                        marker=dict(color='#FF9933'),
-                        selector=dict(mode='markers')
-                    )
-                    
-                    st.plotly_chart(fig_forecast, use_container_width=True)
+                    st.plotly_chart(fig_pred, use_container_width=True)
                     
                     # Forecast statistics
                     st.markdown("---")
                     st.subheader("📊 Prediction Summary")
                     
-                    future_forecast = forecast[forecast['ds'] > df['Date'].max()].head(prediction_days)
-                    
                     col1, col2, col3, col4 = st.columns(4)
                     
                     with col1:
-                        predicted_price = future_forecast['yhat'].iloc[-1]
+                        predicted_price = predictions[-1]
                         st.metric(
                             "Predicted Price",
                             f"₹{predicted_price:.2f}",
@@ -548,18 +596,16 @@ if predict_button:
                         )
                     
                     with col3:
-                        upper_bound = future_forecast['yhat_upper'].iloc[-1]
                         st.metric(
                             "Upper Bound",
-                            f"₹{upper_bound:.2f}",
+                            f"₹{upper_bound[-1]:.2f}",
                             help="95% confidence upper limit"
                         )
                     
                     with col4:
-                        lower_bound = future_forecast['yhat_lower'].iloc[-1]
                         st.metric(
                             "Lower Bound",
-                            f"₹{lower_bound:.2f}",
+                            f"₹{lower_bound[-1]:.2f}",
                             help="95% confidence lower limit"
                         )
                     
@@ -575,33 +621,37 @@ if predict_button:
                             ### 🟢 STRONG BUY Signal
                             - Predicted growth: **{predicted_pct:.2f}%**
                             - Expected return: **₹{predicted_change:.2f}** per share
-                            - Confidence interval: ₹{lower_bound:.2f} - ₹{upper_bound:.2f}
+                            - Confidence interval: ₹{lower_bound[-1]:.2f} - ₹{upper_bound[-1]:.2f}
+                            - Model used: **{model_type}**
                             """)
                         elif predicted_pct > 0:
                             st.info(f"""
                             ### 🔵 BUY Signal
                             - Predicted growth: **{predicted_pct:.2f}%**
                             - Expected return: **₹{predicted_change:.2f}** per share
-                            - Confidence interval: ₹{lower_bound:.2f} - ₹{upper_bound:.2f}
+                            - Confidence interval: ₹{lower_bound[-1]:.2f} - ₹{upper_bound[-1]:.2f}
+                            - Model used: **{model_type}**
                             """)
                         elif predicted_pct > -5:
                             st.warning(f"""
                             ### 🟡 HOLD Signal
                             - Predicted change: **{predicted_pct:.2f}%**
                             - Expected change: **₹{predicted_change:.2f}** per share
-                            - Confidence interval: ₹{lower_bound:.2f} - ₹{upper_bound:.2f}
+                            - Confidence interval: ₹{lower_bound[-1]:.2f} - ₹{upper_bound[-1]:.2f}
+                            - Model used: **{model_type}**
                             """)
                         else:
                             st.error(f"""
                             ### 🔴 SELL Signal
                             - Predicted decline: **{predicted_pct:.2f}%**
                             - Expected loss: **₹{predicted_change:.2f}** per share
-                            - Confidence interval: ₹{lower_bound:.2f} - ₹{upper_bound:.2f}
+                            - Confidence interval: ₹{lower_bound[-1]:.2f} - ₹{upper_bound[-1]:.2f}
+                            - Model used: **{model_type}**
                             """)
                     
                     with col2:
                         # Risk meter
-                        uncertainty = upper_bound - lower_bound
+                        uncertainty = upper_bound[-1] - lower_bound[-1]
                         risk_pct = (uncertainty / predicted_price) * 100
                         
                         st.metric("Risk Level", f"{risk_pct:.1f}%")
@@ -613,31 +663,27 @@ if predict_button:
                         else:
                             st.warning("High Risk ⚡")
                     
-                    # Forecast components
-                    st.markdown("---")
-                    st.subheader("📉 Trend & Seasonality Analysis")
-                    
-                    from prophet.plot import plot_components_plotly
-                    fig_components = plot_components_plotly(model, forecast)
-                    st.plotly_chart(fig_components, use_container_width=True)
-                    
                     # Detailed forecast table
                     st.markdown("---")
                     st.subheader("📋 Detailed Daily Predictions")
                     
-                    forecast_display = future_forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
-                    forecast_display.columns = ['Date', 'Predicted Price (₹)', 'Lower Bound (₹)', 'Upper Bound (₹)']
-                    forecast_display['Date'] = pd.to_datetime(forecast_display['Date']).dt.strftime('%d-%m-%Y')
-                    forecast_display['Predicted Price (₹)'] = forecast_display['Predicted Price (₹)'].round(2)
-                    forecast_display['Lower Bound (₹)'] = forecast_display['Lower Bound (₹)'].round(2)
-                    forecast_display['Upper Bound (₹)'] = forecast_display['Upper Bound (₹)'].round(2)
+                    # Generate future dates
+                    last_date = df.index[-1]
+                    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=prediction_days, freq='D')
+                    
+                    forecast_df = pd.DataFrame({
+                        'Date': future_dates.strftime('%d-%m-%Y'),
+                        'Predicted Price (₹)': predictions.round(2),
+                        'Lower Bound (₹)': lower_bound.round(2),
+                        'Upper Bound (₹)': upper_bound.round(2)
+                    })
                     
                     # Add day-wise change
-                    forecast_display['Change (₹)'] = forecast_display['Predicted Price (₹)'].diff().round(2)
-                    forecast_display['Change (%)'] = (forecast_display['Change (₹)'] / forecast_display['Predicted Price (₹)'].shift(1) * 100).round(2)
+                    forecast_df['Change (₹)'] = forecast_df['Predicted Price (₹)'].diff().round(2)
+                    forecast_df['Change (%)'] = (forecast_df['Change (₹)'] / forecast_df['Predicted Price (₹)'].shift(1) * 100).round(2)
                     
                     st.dataframe(
-                        forecast_display,
+                        forecast_df,
                         use_container_width=True,
                         hide_index=True,
                         height=400
@@ -648,7 +694,7 @@ if predict_button:
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        csv = forecast_display.to_csv(index=False)
+                        csv = forecast_df.to_csv(index=False)
                         st.download_button(
                             label="📥 Download Predictions (CSV)",
                             data=csv,
@@ -659,7 +705,7 @@ if predict_button:
                     
                     with col2:
                         # Download historical data
-                        hist_csv = df.to_csv(index=False)
+                        hist_csv = df_display.to_csv(index=False)
                         st.download_button(
                             label="📥 Download Historical Data",
                             data=hist_csv,
@@ -672,37 +718,38 @@ if predict_button:
                         # Create analysis report
                         report = f"""
 STOCK ANALYSIS REPORT
-{'='*50}
+{'='*60}
 Stock: {company_name}
 Symbol: {stock_symbol}
 Exchange: {exchange}
 Date: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}
 
 CURRENT METRICS
-{'='*50}
+{'='*60}
 Current Price: ₹{metrics['current_price']:.2f}
 Daily Change: ₹{metrics['change']:.2f} ({metrics['pct_change']:.2f}%)
 52 Week High: ₹{metrics['high_52w']:.2f}
 52 Week Low: ₹{metrics['low_52w']:.2f}
 50 Day MA: ₹{metrics['ma_50']:.2f}
 
-PREDICTION ({prediction_days} days)
-{'='*50}
+PREDICTION ({prediction_days} days using {model_type})
+{'='*60}
 Predicted Price: ₹{predicted_price:.2f}
 Expected Change: ₹{predicted_change:.2f} ({predicted_pct:.2f}%)
-Upper Bound: ₹{upper_bound:.2f}
-Lower Bound: ₹{lower_bound:.2f}
+Upper Bound: ₹{upper_bound[-1]:.2f}
+Lower Bound: ₹{lower_bound[-1]:.2f}
 Risk Level: {risk_pct:.1f}%
 
 RECOMMENDATION
-{'='*50}
+{'='*60}
 {'STRONG BUY' if predicted_pct > 5 else 'BUY' if predicted_pct > 0 else 'HOLD' if predicted_pct > -5 else 'SELL'}
 
 Disclaimer: This is an AI-generated prediction for educational purposes only.
 Not financial advice. Please do your own research before investing.
 
 Generated by Indian Stock Prediction App
-University Project
+University Project - Machine Learning Application
+Model: {model_type}
 """
                         st.download_button(
                             label="📄 Download Analysis Report",
@@ -714,7 +761,8 @@ University Project
                     
                 except Exception as e:
                     st.error(f"❌ Error generating predictions: {str(e)}")
-                    st.info("💡 Try adjusting the advanced settings or selecting a different date range.")
+                    import traceback
+                    st.code(traceback.format_exc())
 
 else:
     # Landing page
@@ -735,12 +783,14 @@ else:
         
         - 📊 **Real-time NSE/BSE Data** from Yahoo Finance
         - 📈 **Interactive Charts** with candlesticks and volume
-        - 🤖 **AI-Powered Predictions** using Facebook Prophet
+        - 🤖 **Multiple ML Models** 
+          - Linear Regression
+          - Polynomial Regression
+          - Moving Average
         - 📉 **Technical Analysis** with moving averages
         - 💡 **Investment Recommendations** based on predictions
         - 💾 **Export Data** to CSV and generate reports
         - 🇮🇳 **Indian Currency** (₹ INR) formatting
-        - 📅 **Indian Market Holidays** consideration
         
         ## 🏆 Top Indian Stocks
         
@@ -772,8 +822,9 @@ else:
            - More data = better predictions
         
         3. **Configure Prediction**
-           - Select prediction period (7-365 days)
-           - Adjust advanced settings if needed
+           - Select prediction period (7-90 days)
+           - Choose ML algorithm
+           - Adjust model parameters
         
         4. **Click "Predict Stock Price"**
            - View comprehensive analysis
@@ -788,21 +839,19 @@ else:
         - **BSE Stocks**: Add `.BO` suffix
           - Example: `TCS.BO`, `RELIANCE.BO`
         
-        ## 📚 University Project Details
+        ## 📚 ML Models Available
         
-        **Project Title:** AI-Based Indian Stock Market Prediction System
-        
-        **Technologies Used:**
-        - Python & Streamlit (Frontend)
-        - Facebook Prophet (ML Model)
-        - Yahoo Finance API (Data Source)
-        - Plotly (Visualization)
-        
-        **Features Implemented:**
-        - Time series forecasting
-        - Technical analysis
-        - Risk assessment
-        - Indian market customization
+        1. **Linear Regression**
+           - Best for: Steady trends
+           - Speed: Fast ⚡
+           
+        2. **Polynomial Regression**
+           - Best for: Complex patterns
+           - Speed: Medium ⚡⚡
+           
+        3. **Moving Average**
+           - Best for: Short-term predictions
+           - Speed: Very Fast ⚡⚡⚡
         """)
     
     st.markdown("---")
@@ -833,7 +882,7 @@ else:
     
     This application is developed for **educational and academic purposes only** as part of a university project.
     
-    - Stock market predictions are based on historical data and AI algorithms
+    - Stock market predictions are based on historical data and ML algorithms
     - Past performance does not guarantee future results
     - This is **NOT financial advice**
     - Always consult with a qualified financial advisor before making investment decisions
@@ -847,7 +896,7 @@ st.markdown("---")
 st.markdown("""
     <div style='text-align: center; color: #666; padding: 1rem; background-color: #f0f2f6; border-radius: 0.5rem;'>
         <p style='margin: 0.5rem 0;'><b>🎓 University Project - Indian Stock Market Prediction System</b></p>
-        <p style='margin: 0.5rem 0;'>Made with ❤️ using Streamlit | Data from Yahoo Finance | Predictions by Facebook Prophet</p>
+        <p style='margin: 0.5rem 0;'>Made with ❤️ using Streamlit | Data from Yahoo Finance | ML Models: scikit-learn</p>
         <p style='margin: 0.5rem 0;'>🇮🇳 Customized for NSE/BSE with INR Currency</p>
         <p style='margin: 0.5rem 0; font-size: 0.8rem;'>For Educational Purposes Only | Not Financial Advice</p>
     </div>
