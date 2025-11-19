@@ -1,6 +1,6 @@
 🧠 MarketSense AI — Indian Stock Analysis & Prediction App
 
-🔗 Live Demo: Add your Streamlit link here
+🔗 Live Demo: https://marketsenseai.streamlit.app/
 
 
 📄 Overview
